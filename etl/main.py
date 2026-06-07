@@ -17,7 +17,10 @@ from etl.augment_sample_metadata_from_crawling import AugmentConfig, SampleMetad
 from etl.generate_labelstudio_metadata_input import LabelStudioConfig, LabelStudioMetadataGenerator
 from etl.reconcile_metadata import ReconcileConfig, LabelStudioMetadataReconciler
 from etl.generate_dtsen_dummy import DTSENDummyConfig, DTSENDummyGenerator
-from etl.split_metadata import SplitConfig, HouseTypeAwareIterativeStratifiedSplitter
+from etl.split_metadata import (
+    SplitConfig,
+    HouseTypeAwareHierarchicalStratifiedSplitter,
+)
 
 class RutilahuETLPipeline:
     def __init__(self):
@@ -28,16 +31,16 @@ class RutilahuETLPipeline:
         self.reconciler = LabelStudioMetadataReconciler(ReconcileConfig())
         self.dtsen_generator = DTSENDummyGenerator(DTSENDummyConfig())
 
-        self.splitter = HouseTypeAwareIterativeStratifiedSplitter(
+        self.splitter = HouseTypeAwareHierarchicalStratifiedSplitter(
             SplitConfig(
                 input_path=Path("metadata_sample/reconciled_sample_metadata_with_dtsen.json"),
                 output_dir=Path("metadata_sample/splits_house"),
-                train_ratio=0.75,
-                val_ratio=0.15,
-                test_ratio=0.15,
+                train_ratio=0.8,
+                val_ratio=0.1,
+                test_ratio=0.1,
                 seed=42,
-            )
         )
+    )
 
         self._sampler = None
 

@@ -18,25 +18,24 @@ class SplitConfig:
     test_ratio: float = 0.1
     seed: int = 42
 
+    # Disimpan untuk kompatibilitas dan laporan, tidak dipakai sebagai constraint utama.
+    min_combo_support: int = 10
 
-class HouseTypeAwareIterativeStratifiedSplitter:
+    # Jika True, pembagian kecil tetap diusahakan mengikuti proporsi.
+    enforce_min_split_when_possible: bool = True
+
+
+class HouseTypeAwareHierarchicalStratifiedSplitter:
     """
-    Split metadata with a two-level strategy:
+    Strategi split yang dipakai:
 
-    Level 1:
-      Split by house_type groups so that:
-      - multi
-      - single_exterior_only
-      - single_interior_only
-      all appear across train/val/test as much as possible.
-
-    Level 2:
-      Inside each house_type group, use iterative stratification
-      for:
-      - actual_label.atap
-      - actual_label.dinding
-      - actual_label.lantai
-      - label combination token
+    1) Split dilakukan pada level house_id, jadi satu rumah tidak pernah pecah.
+    2) Split dilakukan terpisah per house_type.
+    3) Dalam setiap house_type, strata yang dipakai hanya label material yang relevan:
+       - multi -> atap, dinding, lantai
+       - single_exterior_only -> atap, dinding
+       - single_interior_only -> lantai
+    4) Combo tidak dipakai sebagai constraint split, hanya untuk laporan distribusi.
     """
 
     SPLITS = ("train", "val", "test")
@@ -45,6 +44,9 @@ class HouseTypeAwareIterativeStratifiedSplitter:
         self.config = config or SplitConfig()
         self.rng = random.Random(self.config.seed)
 
+    # ------------------------------------------------------------------
+    # I/O
+    # ------------------------------------------------------------------
     def load_records(self) -> List[Dict[str, Any]]:
         path = self.config.input_path
         if not path.exists():
@@ -72,6 +74,9 @@ class HouseTypeAwareIterativeStratifiedSplitter:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
+    # ------------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------------
     @staticmethod
     def _normalize_house_type(value: Any) -> Optional[str]:
         if value is None:
@@ -96,7 +101,7 @@ class HouseTypeAwareIterativeStratifiedSplitter:
         text = str(value).strip()
         if not text:
             return None
-        if text == "Tidak Terdeteksi":
+        if text.lower() == "tidak terdeteksi":
             return "Tidak terdeteksi"
         return text
 
@@ -115,56 +120,67 @@ class HouseTypeAwareIterativeStratifiedSplitter:
         }
         return rec
 
-    def _combo_key(self, record: Dict[str, Any], schema: str) -> str:
+    def _normalized_ratios(self) -> List[float]:
+        ratios = [
+            max(float(self.config.train_ratio), 0.0),
+            max(float(self.config.val_ratio), 0.0),
+            max(float(self.config.test_ratio), 0.0),
+        ]
+        total = sum(ratios)
+        if total <= 0:
+            return [0.8, 0.1, 0.1]
+        return [r / total for r in ratios]
+
+    # ------------------------------------------------------------------
+    # Schema / strata logic
+    # ------------------------------------------------------------------
+    def _relevant_components(self, house_type: str) -> Tuple[str, ...]:
+        if house_type == "multi":
+            return ("atap", "dinding", "lantai")
+        if house_type == "single_exterior_only":
+            return ("atap", "dinding")
+        if house_type == "single_interior_only":
+            return ("lantai",)
+        return ()
+
+    def _strata_key(self, record: Dict[str, Any]) -> str:
+        """
+        Key strata yang dipakai untuk balancing.
+        Combo penuh tetap dipertahankan, tetapi hanya sebagai strata statis,
+        bukan token iterative yang saling bertabrakan.
+        """
+        ht = self._normalize_house_type(record.get("house_type"))
+        if ht is None:
+            return "unknown"
+
         actual = record.get("actual_label", {})
         if not isinstance(actual, dict):
             actual = {}
 
-        atap = self._normalize_label(actual.get("atap")) or "None"
-        dinding = self._normalize_label(actual.get("dinding")) or "None"
-        lantai = self._normalize_label(actual.get("lantai")) or "None"
+        parts = [ht]
+        for comp in self._relevant_components(ht):
+            val = self._normalize_label(actual.get(comp)) or "None"
+            parts.append(f"{comp}={val}")
 
-        if schema == "multi":
-            return f"multi::{atap}||{dinding}||{lantai}"
-        if schema == "single_exterior_only":
-            return f"single_exterior_only::{atap}||{dinding}||{lantai}"
-        if schema == "single_interior_only":
-            return f"single_interior_only::{atap}||{dinding}||{lantai}"
+        return "||".join(parts)
 
-        return f"unknown::{atap}||{dinding}||{lantai}"
-
-    def _record_tokens(self, record: Dict[str, Any]) -> Set[str]:
-        """
-        Tokens used for iterative stratification inside a house_type group.
-
-        We include:
-        - atap
-        - dinding
-        - lantai
-        - combo token
-        """
-        tokens: Set[str] = set()
-
+    def _combo_key(self, record: Dict[str, Any], relevant_components: Tuple[str, ...]) -> str:
         actual = record.get("actual_label", {})
         if not isinstance(actual, dict):
             actual = {}
 
-        for comp in ("atap", "dinding", "lantai"):
-            val = self._normalize_label(actual.get(comp))
-            if val is not None:
-                tokens.add(f"{comp}={val}")
+        parts = []
+        for comp in relevant_components:
+            val = self._normalize_label(actual.get(comp)) or "None"
+            parts.append(f"{comp}={val}")
+        return "||".join(parts)
 
-        ht = self._normalize_house_type(record.get("house_type")) or "unknown"
-        tokens.add(self._combo_key(record, ht))
-
-        return tokens
-
+    # ------------------------------------------------------------------
+    # Split size utilities
+    # ------------------------------------------------------------------
     def _desired_split_sizes(self, n: int) -> Dict[str, int]:
         """
-        Proportional split sizes, with guarantees:
-        - n == 1 -> train only
-        - n == 2 -> train + val
-        - n >= 3 -> each split gets at least 1 if possible
+        Hitung ukuran split yang proporsional dan totalnya tepat sama dengan n.
         """
         if n <= 0:
             return {"train": 0, "val": 0, "test": 0}
@@ -175,7 +191,7 @@ class HouseTypeAwareIterativeStratifiedSplitter:
         if n == 2:
             return {"train": 1, "val": 1, "test": 0}
 
-        ratios = [self.config.train_ratio, self.config.val_ratio, self.config.test_ratio]
+        ratios = self._normalized_ratios()
         raw = [n * r for r in ratios]
         base = [int(math.floor(x)) for x in raw]
         remainder = n - sum(base)
@@ -184,247 +200,202 @@ class HouseTypeAwareIterativeStratifiedSplitter:
         for i in frac_order[:remainder]:
             base[i] += 1
 
-        # ensure each split at least 1 if n >= 3
-        for i in range(3):
-            if base[i] == 0:
-                base[i] = 1
+        if self.config.enforce_min_split_when_possible:
+            for i in range(3):
+                if base[i] == 0 and n >= 3:
+                    donor = max(range(3), key=lambda x: base[x])
+                    if base[donor] > 1:
+                        base[donor] -= 1
+                        base[i] += 1
 
-        # rebalance if too many
+        while sum(base) < n:
+            donor = max(range(3), key=lambda i: ratios[i])
+            base[donor] += 1
+
         while sum(base) > n:
-            idx = max(range(3), key=lambda i: base[i])
-            if base[idx] > 1:
-                base[idx] -= 1
+            donor = max(range(3), key=lambda i: base[i])
+            if base[donor] > 1:
+                base[donor] -= 1
             else:
                 break
 
-        # final safety
-        while sum(base) < n:
-            idx = max(range(3), key=lambda i: [self.config.train_ratio, self.config.val_ratio, self.config.test_ratio][i])
-            base[idx] += 1
+        return {"train": base[0], "val": base[1], "test": base[2]}
 
-        return {
-            "train": base[0],
-            "val": base[1],
-            "test": base[2],
-        }
-
-    def _token_targets(self, token_counts: Counter) -> Dict[str, Dict[str, int]]:
-        """
-        Per-token target occurrence per split.
-
-        Special rules:
-        - count 1 -> train only
-        - count 2 -> train + val
-        - count 3 -> train + val + test
-        - count > 3 -> proportional
-        """
-        targets: Dict[str, Dict[str, int]] = {}
-
-        for token, count in token_counts.items():
-            if count == 1:
-                targets[token] = {"train": 1, "val": 0, "test": 0}
-                continue
-            if count == 2:
-                targets[token] = {"train": 1, "val": 1, "test": 0}
-                continue
-            if count == 3:
-                targets[token] = {"train": 1, "val": 1, "test": 1}
-                continue
-
-            ratios = [self.config.train_ratio, self.config.val_ratio, self.config.test_ratio]
-            raw = [count * r for r in ratios]
-            base = [int(math.floor(x)) for x in raw]
-            remainder = count - sum(base)
-
-            frac_order = sorted(range(3), key=lambda i: (raw[i] - base[i]), reverse=True)
-            for i in frac_order[:remainder]:
-                base[i] += 1
-
-            while sum(base) > count:
-                idx = max(range(3), key=lambda i: base[i])
-                base[idx] -= 1
-
-            targets[token] = {
-                "train": base[0],
-                "val": base[1],
-                "test": base[2],
-            }
-
-        return targets
-
-
-    def _sample_priority(
+    def _allocate_counts_by_remaining(
         self,
-        sample_idx: int,
-        sample_tokens: Dict[int, Set[str]],
-        token_counts: Counter,
-        remaining_targets: Dict[str, Dict[str, int]],
-    ) -> float:
-        tokens = sample_tokens[sample_idx]
-        score = 0.0
+        n: int,
+        remaining_targets: Dict[str, int],
+    ) -> Dict[str, int]:
+        """
+        Alokasikan n sampel ke train/val/test berdasarkan remaining target yang masih tersedia.
+        """
+        splits = list(self.SPLITS)
+        available = [max(0, remaining_targets[s]) for s in splits]
+        total_available = sum(available)
 
-        for token in tokens:
-            support = max(token_counts[token], 1)
-            remaining_total = sum(remaining_targets[token].values())
-            rarity = 1.0 / support
-            score += rarity * 2.0
-            score += rarity * remaining_total
+        if total_available <= 0:
+            return {"train": n, "val": 0, "test": 0}
 
-        return score
+        ideal = [n * a / total_available for a in available]
+        base = [min(int(math.floor(x)), available[i]) for i, x in enumerate(ideal)]
+        left = n - sum(base)
 
-    def _choose_split(
-        self,
-        tokens: Set[str],
-        split_sizes: Dict[str, int],
-        current_sizes: Dict[str, int],
-        remaining_targets: Dict[str, Dict[str, int]],
-        token_counts: Counter,
-    ) -> str:
-        candidates = [s for s in self.SPLITS if current_sizes[s] < split_sizes[s]]
-        if not candidates:
-            return "train"
+        while left > 0:
+            progressed = False
+            fractions = [ideal[i] - math.floor(ideal[i]) for i in range(3)]
+            order = sorted(range(3), key=lambda i: (fractions[i], available[i] - base[i]), reverse=True)
 
-        best_split = candidates[0]
-        best_score = float("-inf")
+            for i in order:
+                if left <= 0:
+                    break
+                if base[i] < available[i]:
+                    base[i] += 1
+                    left -= 1
+                    progressed = True
 
-        for split in candidates:
-            cap_left = split_sizes[split] - current_sizes[split]
-            score = cap_left * 0.02
+            if not progressed:
+                # Fallback: isi ke split yang masih punya ruang terbesar
+                order = sorted(range(3), key=lambda i: available[i] - base[i], reverse=True)
+                for i in order:
+                    if left <= 0:
+                        break
+                    if base[i] < available[i]:
+                        base[i] += 1
+                        left -= 1
+                        progressed = True
 
-            for token in tokens:
-                support = max(token_counts[token], 1)
-                deficit = remaining_targets[token][split]
-                weight = 5.0 if token_counts[token] <= 3 else 1.0
-                score += weight * (deficit / support)
+            if not progressed:
+                break
 
-            # tie-break
-            if split == "train":
-                score += 0.03
-            elif split == "val":
-                score += 0.02
-            else:
-                score += 0.01
+        return {"train": base[0], "val": base[1], "test": base[2]}
 
-            if score > best_score:
-                best_score = score
-                best_split = split
+    # ------------------------------------------------------------------
+    # House grouping
+    # ------------------------------------------------------------------
+    def _build_units(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Bentuk unit split berdasarkan house_id.
+        Satu unit = satu rumah, dan semua record dengan house_id yang sama
+        ditempatkan ke split yang sama.
+        """
+        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-        return best_split
+        for idx, record in enumerate(records):
+            rec = self._normalize_record(record)
+            house_id = str(rec.get("house_id") or f"__row_{idx}__")
+            grouped[house_id].append(rec)
 
-    def _iterative_split_group(self, group_records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        n = len(group_records)
-        if n == 0:
+        units: List[Dict[str, Any]] = []
+        for house_id, recs in grouped.items():
+            house_type = None
+            for rec in recs:
+                ht = self._normalize_house_type(rec.get("house_type"))
+                if ht in {"multi", "single_exterior_only", "single_interior_only"}:
+                    house_type = ht
+                    break
+
+            if house_type is None:
+                continue
+
+            strata_key = None
+            for rec in recs:
+                # Ambil strata key dari record pertama yang valid
+                strata_key = self._strata_key(rec)
+                break
+
+            if strata_key is None:
+                continue
+
+            units.append(
+                {
+                    "house_id": house_id,
+                    "house_type": house_type,
+                    "records": recs,
+                    "size": len(recs),
+                    "strata_key": strata_key,
+                }
+            )
+
+        return units
+
+    # ------------------------------------------------------------------
+    # Split per house_type
+    # ------------------------------------------------------------------
+    def _split_units_in_group(self, units: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        total_size = sum(unit["size"] for unit in units)
+        if total_size <= 0:
             return {"train": [], "val": [], "test": []}
 
-        split_sizes = self._desired_split_sizes(n)
+        split_targets = self._desired_split_sizes(total_size)
+        remaining = dict(split_targets)
 
-        sample_tokens: Dict[int, Set[str]] = {}
-        token_counts = Counter()
-        token_to_samples: Dict[str, Set[int]] = defaultdict(set)
+        strata_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for unit in units:
+            strata_groups[unit["strata_key"]].append(unit)
 
-        for idx, rec in enumerate(group_records):
-            tokens = self._record_tokens(rec)
-            sample_tokens[idx] = tokens
-            for token in tokens:
-                token_counts[token] += 1
-                token_to_samples[token].add(idx)
+        # Proses strata besar terlebih dahulu agar distribusi combo besar stabil.
+        ordered_strata = sorted(
+            strata_groups.items(),
+            key=lambda kv: (-sum(u["size"] for u in kv[1]), kv[0]),
+        )
 
-        remaining_targets = self._token_targets(token_counts)
-
-        split_buckets: Dict[str, List[Dict[str, Any]]] = {
+        buckets: Dict[str, List[Dict[str, Any]]] = {
             "train": [],
             "val": [],
             "test": [],
         }
-        current_sizes = {"train": 0, "val": 0, "test": 0}
-        unassigned: Set[int] = set(range(n))
 
-        # anchor rare labels first (count 1/2/3)
-        rare_tokens = sorted(token_counts.keys(), key=lambda t: (token_counts[t], t))
-        for token in rare_tokens:
-            if token_counts[token] > 3:
-                continue
+        for _, strata_units in ordered_strata:
+            self.rng.shuffle(strata_units)
+            n = sum(unit["size"] for unit in strata_units)
+            alloc = self._allocate_counts_by_remaining(n, remaining)
 
-            preferred_splits = {
-                1: ["train"],
-                2: ["train", "val"],
-                3: ["train", "val", "test"],
-            }[token_counts[token]]
+            # Karena unit size biasanya 1, kita assign berdasarkan urutan unit.
+            # Jika ada unit size > 1, tetap diperlakukan sebagai satu kesatuan.
+            # Untuk kasus umum dataset ini, size = 1 per house_id.
+            split_sequence: List[str] = (
+                ["train"] * alloc["train"] +
+                ["val"] * alloc["val"] +
+                ["test"] * alloc["test"]
+            )
 
-            for split in preferred_splits:
-                if current_sizes[split] >= split_sizes[split]:
-                    continue
+            if len(split_sequence) < len(strata_units):
+                # Safety fallback
+                deficit = len(strata_units) - len(split_sequence)
+                split_sequence += ["train"] * deficit
+            elif len(split_sequence) > len(strata_units):
+                split_sequence = split_sequence[:len(strata_units)]
 
-                candidates = list(token_to_samples[token] & unassigned)
-                if not candidates:
-                    continue
+            self.rng.shuffle(split_sequence)
 
-                best_idx = max(
-                    candidates,
-                    key=lambda i: self._sample_priority(i, sample_tokens, token_counts, remaining_targets),
-                )
+            for unit, split in zip(strata_units, split_sequence):
+                for rec in unit["records"]:
+                    rec_to_store = dict(rec)
+                    rec_to_store["split"] = split
+                    buckets[split].append(rec_to_store)
 
-                rec = dict(group_records[best_idx])
-                rec["split"] = split
-                split_buckets[split].append(rec)
-                current_sizes[split] += 1
+                remaining[split] -= unit["size"]
+                if remaining[split] < 0:
+                    remaining[split] = 0
 
-                for tok in sample_tokens[best_idx]:
-                    if remaining_targets[tok][split] > 0:
-                        remaining_targets[tok][split] -= 1
+        return buckets
 
-                unassigned.remove(best_idx)
-
-        # iterative pass
-        while unassigned:
-            active_tokens = [t for t in rare_tokens if token_to_samples[t] & unassigned]
-            if not active_tokens:
-                idx = next(iter(unassigned))
-                candidates = [s for s in self.SPLITS if current_sizes[s] < split_sizes[s]]
-                chosen_split = max(candidates, key=lambda s: split_sizes[s] - current_sizes[s]) if candidates else "train"
-            else:
-                target_token = active_tokens[0]  # rarest active token
-                candidate_indices = list(token_to_samples[target_token] & unassigned)
-
-                idx = max(
-                    candidate_indices,
-                    key=lambda i: self._sample_priority(i, sample_tokens, token_counts, remaining_targets),
-                )
-
-                chosen_split = self._choose_split(
-                    tokens=sample_tokens[idx],
-                    split_sizes=split_sizes,
-                    current_sizes=current_sizes,
-                    remaining_targets=remaining_targets,
-                    token_counts=token_counts,
-                )
-
-            rec = dict(group_records[idx])
-            rec["split"] = chosen_split
-            split_buckets[chosen_split].append(rec)
-            current_sizes[chosen_split] += 1
-
-            for tok in sample_tokens[idx]:
-                if remaining_targets[tok][chosen_split] > 0:
-                    remaining_targets[tok][chosen_split] -= 1
-
-            unassigned.remove(idx)
-
-        return split_buckets
-
-
+    # ------------------------------------------------------------------
+    # Main split
+    # ------------------------------------------------------------------
     def split(self, records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        groups: Dict[str, List[Dict[str, Any]]] = {
+        units = self._build_units(records)
+
+        grouped_by_type: Dict[str, List[Dict[str, Any]]] = {
             "multi": [],
             "single_exterior_only": [],
             "single_interior_only": [],
         }
 
-        for rec in records:
-            ht = self._normalize_house_type(rec.get("house_type"))
-            if ht not in groups:
-                continue
-            groups[ht].append(self._normalize_record(rec))
+        for unit in units:
+            ht = unit["house_type"]
+            if ht in grouped_by_type:
+                grouped_by_type[ht].append(unit)
 
         final_buckets: Dict[str, List[Dict[str, Any]]] = {
             "train": [],
@@ -432,24 +403,24 @@ class HouseTypeAwareIterativeStratifiedSplitter:
             "test": [],
         }
 
-        # split each house_type separately, then merge
-        for house_type, group_records in groups.items():
-            shuffled = group_records[:]
-            self.rng.shuffle(shuffled)
+        for house_type, type_units in grouped_by_type.items():
+            if not type_units:
+                continue
 
-            group_split = self._iterative_split_group(shuffled)
+            split_result = self._split_units_in_group(type_units)
 
             for split in self.SPLITS:
-                final_buckets[split].extend(group_split[split])
+                final_buckets[split].extend(split_result[split])
 
-        # final shuffle in each split
         for split in self.SPLITS:
             self.rng.shuffle(final_buckets[split])
 
         return final_buckets
 
-
-    def _extract_global_label_counter(self, records: List[Dict[str, Any]], comp: str) -> Counter:
+    # ------------------------------------------------------------------
+    # Summary helpers
+    # ------------------------------------------------------------------
+    def _counter_by_component(self, records: List[Dict[str, Any]], comp: str) -> Counter:
         counter = Counter()
         for rec in records:
             actual = rec.get("actual_label", {})
@@ -460,94 +431,79 @@ class HouseTypeAwareIterativeStratifiedSplitter:
                 counter[str(val)] += 1
         return counter
 
-    def _extract_combo_counter(self, records: List[Dict[str, Any]], schema: Optional[str] = None) -> Counter:
+    def _combo_counter(self, records: List[Dict[str, Any]], house_type: Optional[str] = None) -> Counter:
         counter = Counter()
         for rec in records:
-            actual = rec.get("actual_label", {})
-            if not isinstance(actual, dict):
+            ht = self._normalize_house_type(rec.get("house_type"))
+            if house_type is not None and ht != house_type:
                 continue
 
-            atap = actual.get("atap")
-            dinding = actual.get("dinding")
-            lantai = actual.get("lantai")
+            relevant_components = self._relevant_components(ht or "")
+            if not relevant_components:
+                continue
 
-            key = f"{atap}||{dinding}||{lantai}"
-
-            if schema is None:
-                counter[key] += 1
-            else:
-                ht = self._normalize_house_type(rec.get("house_type")) or "unknown"
-                if ht == schema:
-                    counter[key] += 1
+            counter[self._combo_key(rec, relevant_components)] += 1
 
         return counter
 
     def summarize(self, split_buckets: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
         split_sizes = {s: len(split_buckets[s]) for s in self.SPLITS}
 
-        house_type_dist = {
+        house_type_distribution = {
             split: dict(Counter(rec.get("house_type", "unknown") for rec in split_buckets[split]))
             for split in self.SPLITS
         }
 
-        global_label_dist = {}
-        for comp in ("atap", "dinding", "lantai"):
-            global_label_dist[comp] = {
-                split: dict(self._extract_global_label_counter(split_buckets[split], comp))
+        label_distribution_global = {
+            comp: {
+                split: dict(self._counter_by_component(split_buckets[split], comp))
                 for split in self.SPLITS
             }
-
-        per_schema_label_dist: Dict[str, Dict[str, Dict[str, int]]] = {
-            "multi": {},
-            "single_exterior_only": {},
-            "single_interior_only": {},
+            for comp in ("atap", "dinding", "lantai")
         }
-        for schema in per_schema_label_dist.keys():
-            schema_records_by_split = {
-                split: [r for r in split_buckets[split] if self._normalize_house_type(r.get("house_type")) == schema]
+
+        label_distribution_by_schema: Dict[str, Dict[str, Dict[str, int]]] = {}
+        combo_distribution_by_schema: Dict[str, Dict[str, Dict[str, int]]] = {}
+
+        for schema in ("multi", "single_exterior_only", "single_interior_only"):
+            schema_label_dist: Dict[str, Dict[str, int]] = {}
+            for comp in self._relevant_components(schema):
+                schema_label_dist[comp] = {
+                    split: dict(
+                        Counter(
+                            str(rec.get("actual_label", {}).get(comp))
+                            for rec in split_buckets[split]
+                            if self._normalize_house_type(rec.get("house_type")) == schema
+                            and isinstance(rec.get("actual_label", {}), dict)
+                            and rec.get("actual_label", {}).get(comp) is not None
+                        )
+                    )
+                    for split in self.SPLITS
+                }
+            label_distribution_by_schema[schema] = schema_label_dist
+
+            combo_distribution_by_schema[schema] = {
+                split: dict(self._combo_counter(split_buckets[split], house_type=schema))
                 for split in self.SPLITS
             }
-            for comp in ("atap", "dinding", "lantai"):
-                per_schema_label_dist[schema][comp] = dict(
-                    Counter(
-                        str(rec.get("actual_label", {}).get(comp))
-                        for split in self.SPLITS
-                        for rec in schema_records_by_split[split]
-                        if isinstance(rec.get("actual_label", {}), dict) and rec.get("actual_label", {}).get(comp) is not None
-                    )
-                )
 
-        global_combo_dist = {
-            split: dict(self._extract_combo_counter(split_buckets[split], schema=None))
+        combo_distribution_global = {
+            split: dict(self._combo_counter(split_buckets[split], house_type=None))
             for split in self.SPLITS
         }
 
-        per_schema_combo_dist: Dict[str, Dict[str, Dict[str, int]]] = {
-            "multi": {},
-            "single_exterior_only": {},
-            "single_interior_only": {},
-        }
-        for schema in per_schema_combo_dist.keys():
-            per_schema_combo_dist[schema] = {
-                split: dict(
-                    Counter(
-                        f"{rec.get('actual_label', {}).get('atap')}||{rec.get('actual_label', {}).get('dinding')}||{rec.get('actual_label', {}).get('lantai')}"
-                        for rec in split_buckets[split]
-                        if self._normalize_house_type(rec.get("house_type")) == schema
-                    )
-                )
-                for split in self.SPLITS
-            }
-
         return {
             "split_sizes": split_sizes,
-            "house_type_distribution": house_type_dist,
-            "label_distribution_global": global_label_dist,
-            "label_distribution_by_schema": per_schema_label_dist,
-            "combo_distribution_global": global_combo_dist,
-            "combo_distribution_by_schema": per_schema_combo_dist,
+            "house_type_distribution": house_type_distribution,
+            "label_distribution_global": label_distribution_global,
+            "label_distribution_by_schema": label_distribution_by_schema,
+            "combo_distribution_global": combo_distribution_global,
+            "combo_distribution_by_schema": combo_distribution_by_schema,
         }
 
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
     def run(self) -> Dict[str, Any]:
         records = self.load_records()
         split_buckets = self.split(records)
@@ -577,3 +533,11 @@ class HouseTypeAwareIterativeStratifiedSplitter:
             "all_path": str(all_path),
             **summary,
         }
+
+
+if __name__ == "__main__":
+    splitter = HouseTypeAwareHierarchicalStratifiedSplitter()
+    result = splitter.run()
+
+    print(json.dumps(result["split_sizes"], ensure_ascii=False, indent=2))
+    print(json.dumps(result["house_type_distribution"], ensure_ascii=False, indent=2))
