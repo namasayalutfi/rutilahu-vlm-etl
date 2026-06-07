@@ -34,7 +34,7 @@ class RutilahuETLPipeline:
         self.splitter = HouseTypeAwareHierarchicalStratifiedSplitter(
             SplitConfig(
                 input_path=Path("metadata_sample/reconciled_sample_metadata_with_dtsen.json"),
-                output_dir=Path("metadata_sample/splits_house"),
+                output_dir=Path("metadata_sample/splits_house_type_aware"),
                 train_ratio=0.8,
                 val_ratio=0.1,
                 test_ratio=0.1,

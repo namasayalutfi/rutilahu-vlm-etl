@@ -44,9 +44,6 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
         self.config = config or SplitConfig()
         self.rng = random.Random(self.config.seed)
 
-    # ------------------------------------------------------------------
-    # I/O
-    # ------------------------------------------------------------------
     def load_records(self) -> List[Dict[str, Any]]:
         path = self.config.input_path
         if not path.exists():
@@ -74,9 +71,6 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    # ------------------------------------------------------------------
-    # Normalization
-    # ------------------------------------------------------------------
     @staticmethod
     def _normalize_house_type(value: Any) -> Optional[str]:
         if value is None:
@@ -131,9 +125,6 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
             return [0.8, 0.1, 0.1]
         return [r / total for r in ratios]
 
-    # ------------------------------------------------------------------
-    # Schema / strata logic
-    # ------------------------------------------------------------------
     def _relevant_components(self, house_type: str) -> Tuple[str, ...]:
         if house_type == "multi":
             return ("atap", "dinding", "lantai")
@@ -146,8 +137,6 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
     def _strata_key(self, record: Dict[str, Any]) -> str:
         """
         Key strata yang dipakai untuk balancing.
-        Combo penuh tetap dipertahankan, tetapi hanya sebagai strata statis,
-        bukan token iterative yang saling bertabrakan.
         """
         ht = self._normalize_house_type(record.get("house_type"))
         if ht is None:
@@ -175,22 +164,24 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
             parts.append(f"{comp}={val}")
         return "||".join(parts)
 
-    # ------------------------------------------------------------------
-    # Split size utilities
-    # ------------------------------------------------------------------
     def _desired_split_sizes(self, n: int) -> Dict[str, int]:
         """
-        Hitung ukuran split yang proporsional dan totalnya tepat sama dengan n.
+        Hitung ukuran split yang proporsional secara saklek per kombinasi/strata lokal.
         """
         if n <= 0:
             return {"train": 0, "val": 0, "test": 0}
 
+        # FIX: Aturan Saklek Kelompok Kecil per Kombinasi
         if n == 1:
             return {"train": 1, "val": 0, "test": 0}
 
         if n == 2:
-            return {"train": 1, "val": 1, "test": 0}
+            return {"train": 1, "val": 0, "test": 1}
 
+        if n == 3:
+            return {"train": 1, "val": 1, "test": 1}
+
+        # Aturan untuk n > 3 (Mengikuti proporsi rasio global)
         ratios = self._normalized_ratios()
         raw = [n * r for r in ratios]
         base = [int(math.floor(x)) for x in raw]
@@ -221,62 +212,9 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
 
         return {"train": base[0], "val": base[1], "test": base[2]}
 
-    def _allocate_counts_by_remaining(
-        self,
-        n: int,
-        remaining_targets: Dict[str, int],
-    ) -> Dict[str, int]:
-        """
-        Alokasikan n sampel ke train/val/test berdasarkan remaining target yang masih tersedia.
-        """
-        splits = list(self.SPLITS)
-        available = [max(0, remaining_targets[s]) for s in splits]
-        total_available = sum(available)
-
-        if total_available <= 0:
-            return {"train": n, "val": 0, "test": 0}
-
-        ideal = [n * a / total_available for a in available]
-        base = [min(int(math.floor(x)), available[i]) for i, x in enumerate(ideal)]
-        left = n - sum(base)
-
-        while left > 0:
-            progressed = False
-            fractions = [ideal[i] - math.floor(ideal[i]) for i in range(3)]
-            order = sorted(range(3), key=lambda i: (fractions[i], available[i] - base[i]), reverse=True)
-
-            for i in order:
-                if left <= 0:
-                    break
-                if base[i] < available[i]:
-                    base[i] += 1
-                    left -= 1
-                    progressed = True
-
-            if not progressed:
-                # Fallback: isi ke split yang masih punya ruang terbesar
-                order = sorted(range(3), key=lambda i: available[i] - base[i], reverse=True)
-                for i in order:
-                    if left <= 0:
-                        break
-                    if base[i] < available[i]:
-                        base[i] += 1
-                        left -= 1
-                        progressed = True
-
-            if not progressed:
-                break
-
-        return {"train": base[0], "val": base[1], "test": base[2]}
-
-    # ------------------------------------------------------------------
-    # House grouping
-    # ------------------------------------------------------------------
     def _build_units(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Bentuk unit split berdasarkan house_id.
-        Satu unit = satu rumah, dan semua record dengan house_id yang sama
-        ditempatkan ke split yang sama.
         """
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
@@ -299,7 +237,6 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
 
             strata_key = None
             for rec in recs:
-                # Ambil strata key dari record pertama yang valid
                 strata_key = self._strata_key(rec)
                 break
 
@@ -318,26 +255,10 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
 
         return units
 
-    # ------------------------------------------------------------------
-    # Split per house_type
-    # ------------------------------------------------------------------
     def _split_units_in_group(self, units: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
         total_size = sum(unit["size"] for unit in units)
         if total_size <= 0:
             return {"train": [], "val": [], "test": []}
-
-        split_targets = self._desired_split_sizes(total_size)
-        remaining = dict(split_targets)
-
-        strata_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for unit in units:
-            strata_groups[unit["strata_key"]].append(unit)
-
-        # Proses strata besar terlebih dahulu agar distribusi combo besar stabil.
-        ordered_strata = sorted(
-            strata_groups.items(),
-            key=lambda kv: (-sum(u["size"] for u in kv[1]), kv[0]),
-        )
 
         buckets: Dict[str, List[Dict[str, Any]]] = {
             "train": [],
@@ -345,27 +266,32 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
             "test": [],
         }
 
+        # Group berdasarkan kombinasi strata unik
+        strata_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for unit in units:
+            strata_groups[unit["strata_key"]].append(unit)
+
+        # Urutkan dari strata dengan jumlah rumah terbanyak
+        ordered_strata = sorted(
+            strata_groups.items(),
+            key=lambda kv: (-sum(u["size"] for u in kv[1]), kv[0]),
+        )
+
         for _, strata_units in ordered_strata:
             self.rng.shuffle(strata_units)
-            n = sum(unit["size"] for unit in strata_units)
-            alloc = self._allocate_counts_by_remaining(n, remaining)
+            
+            # FIX UTAMA: Hitung target split berdasarkan total rumah di kombinasi ini
+            num_units = len(strata_units)
+            alloc = self._desired_split_sizes(num_units)
 
-            # Karena unit size biasanya 1, kita assign berdasarkan urutan unit.
-            # Jika ada unit size > 1, tetap diperlakukan sebagai satu kesatuan.
-            # Untuk kasus umum dataset ini, size = 1 per house_id.
+            # Buat sequence distribusi split berdasarkan target alloc kombinasi ini
             split_sequence: List[str] = (
                 ["train"] * alloc["train"] +
                 ["val"] * alloc["val"] +
                 ["test"] * alloc["test"]
             )
 
-            if len(split_sequence) < len(strata_units):
-                # Safety fallback
-                deficit = len(strata_units) - len(split_sequence)
-                split_sequence += ["train"] * deficit
-            elif len(split_sequence) > len(strata_units):
-                split_sequence = split_sequence[:len(strata_units)]
-
+            # Acak urutan sequence split agar distribusi antar rumah bersifat random
             self.rng.shuffle(split_sequence)
 
             for unit, split in zip(strata_units, split_sequence):
@@ -374,15 +300,8 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
                     rec_to_store["split"] = split
                     buckets[split].append(rec_to_store)
 
-                remaining[split] -= unit["size"]
-                if remaining[split] < 0:
-                    remaining[split] = 0
-
         return buckets
 
-    # ------------------------------------------------------------------
-    # Main split
-    # ------------------------------------------------------------------
     def split(self, records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
         units = self._build_units(records)
 
@@ -417,9 +336,6 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
 
         return final_buckets
 
-    # ------------------------------------------------------------------
-    # Summary helpers
-    # ------------------------------------------------------------------
     def _counter_by_component(self, records: List[Dict[str, Any]], comp: str) -> Counter:
         counter = Counter()
         for rec in records:
@@ -501,9 +417,6 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
             "combo_distribution_by_schema": combo_distribution_by_schema,
         }
 
-    # ------------------------------------------------------------------
-    # Run
-    # ------------------------------------------------------------------
     def run(self) -> Dict[str, Any]:
         records = self.load_records()
         split_buckets = self.split(records)
@@ -533,11 +446,3 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
             "all_path": str(all_path),
             **summary,
         }
-
-
-if __name__ == "__main__":
-    splitter = HouseTypeAwareHierarchicalStratifiedSplitter()
-    result = splitter.run()
-
-    print(json.dumps(result["split_sizes"], ensure_ascii=False, indent=2))
-    print(json.dumps(result["house_type_distribution"], ensure_ascii=False, indent=2))
