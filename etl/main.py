@@ -21,6 +21,7 @@ from etl.split_metadata import (
     SplitConfig,
     HouseTypeAwareHierarchicalStratifiedSplitter,
 )
+from etl.scrape_google_images import GoogleImageScraperConfig, GoogleImageUrlsExtractor
 
 class RutilahuETLPipeline:
     def __init__(self):
@@ -30,7 +31,13 @@ class RutilahuETLPipeline:
         self.labelstudio_generator = LabelStudioMetadataGenerator(LabelStudioConfig())
         self.reconciler = LabelStudioMetadataReconciler(ReconcileConfig())
         self.dtsen_generator = DTSENDummyGenerator(DTSENDummyConfig())
-
+        self.image_scraper = GoogleImageUrlsExtractor(
+            GoogleImageScraperConfig(
+                data_dir=PROJECT_ROOT / "data",
+                output_dir=PROJECT_ROOT / "data" / "scraped_urls", # Output disatukan di folder baru dalam data
+                max_scrolls=3
+            )
+        )
         self.splitter = HouseTypeAwareHierarchicalStratifiedSplitter(
             SplitConfig(
                 input_path=Path("metadata_sample/reconciled_sample_metadata_with_dtsen.json"),
@@ -40,6 +47,7 @@ class RutilahuETLPipeline:
                 test_ratio=0.1,
                 seed=42,
         )
+        
     )
 
         self._sampler = None
@@ -120,6 +128,12 @@ class RutilahuETLPipeline:
         for schema, schema_dist in result["combo_distribution_by_schema"].items():
             print(f"  {schema}: {schema_dist}")
 
+    def run_scrape_images(self) -> None:
+        result = self.image_scraper.run()
+        print("\n[OK] Scraping URL Google Images selesai.")
+        for k, v in result.items():
+            print(f"File {k}: Berhasil mengekstrak {v} URL.")
+
     def run_all(self) -> None:
         # extract dijalankan di local,
         # sedangkan download + metadata + sampling dijalankan di server.
@@ -169,6 +183,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Split metadata menjadi train/val/test dengan house_type-aware iterative stratification",
     )
+    parser.add_argument(
+        "--scrape_images",
+        action="store_true",
+        help="Jalankan scraping image url di Google secara headless",
+    )
     parser.add_argument("--all", action="store_true", help="Jalankan keseluruhan pipeline ETL")
     return parser
 
@@ -217,6 +236,10 @@ def main():
         pipeline.run_split_metadata()
         did_run = True
 
+    if args.scrape_images:
+        pipeline.run_scrape_images()
+        did_run = True
+        
     if not did_run:
         parser.print_help()
 

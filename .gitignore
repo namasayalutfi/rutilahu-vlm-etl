@@ -209,6 +209,15 @@ __marimo__/
 # Data directories (large files)
 /data/*
 !/data/.gitkeep
+# Include specific keyword files
+!/data/keyword_atap_jerami_ijuk_daun_rumbia.txt
+!/data/keyword_atap_kayu_sirap.txt
+!/data/keyword_dinding_anyaman_bambu.txt
+!/data/keyword_dinding_bambu.txt
+!/data/keyword_dinding_batang_kayu.txt
+!/data/keyword_lantai_marmer_granit.txt
+!/data/keyword_lantai_parket_vinil_karpet.txt
+!/data/keyword_lantai_kayu_papan.txt
 
 /metadata/*
 !/metadata/.gitkeep
