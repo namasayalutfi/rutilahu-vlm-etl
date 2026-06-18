@@ -1,23 +1,30 @@
 import json
 from pathlib import Path
 
-file_path = Path("metadata_sample/reconciled_sample_metadata.json")
+file_path = Path("metadata/metadata.jsonl")
 
+# baca jsonl
+data = []
 with open(file_path, "r", encoding="utf-8") as f:
-    data = json.load(f)
+    for line in f:
+        line = line.strip()
+        if line:
+            data.append(json.loads(line))
 
+# modifikasi
 for record in data:
-    # hapus field match jika ada
     record.pop("match", None)
 
-    # tambahkan field status
     record["status"] = {
         "atap": None,
         "dinding": None,
         "lantai": None,
     }
 
+# tulis kembali sebagai jsonl
 with open(file_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
+    for record in data:
+        f.write(json.dumps(record, ensure_ascii=False))
+        f.write("\n")
 
 print(f"Updated {len(data)} records")

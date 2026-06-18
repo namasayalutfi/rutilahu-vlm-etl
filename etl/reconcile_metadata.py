@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 
 ATAP_MAP = {
@@ -52,36 +52,46 @@ LANTAI_MAP = {
 
 @dataclass
 class ReconcileConfig:
-    sample_metadata_path: Path = Path("metadata_sample/sample_metadata_augmented_fixed.jsonl")
-    labelstudio_output_path: Path = Path("data/labelstudio_output_fixed.json")
-    output_json_path: Path = Path("metadata_sample/reconciled_sample_metadata.json")
+    metadata_path: Path = Path("metadata/mkn2_metadata_merged.json")
+    labelstudio_output_path: Path = Path("data/labelstudio_output_merged.json")
+    output_json_path: Path = Path("metadata/reconciled_mkn2_metadata.json")
 
 
 class LabelStudioMetadataReconciler:
     def __init__(self, config: ReconcileConfig | None = None):
         self.config = config or ReconcileConfig()
 
+    # -----------------------------
+    # I/O
+    # -----------------------------
     @staticmethod
-    def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
-        if not path.exists():
-            raise FileNotFoundError(f"File tidak ditemukan: {path}")
-
-        records: List[Dict[str, Any]] = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    records.append(json.loads(line))
-        return records
-
-    @staticmethod
-    def _read_json(path: Path) -> Any:
+    def _read_json_records(path: Path) -> List[Dict[str, Any]]:
         if not path.exists():
             raise FileNotFoundError(f"File tidak ditemukan: {path}")
 
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            content = f.read().strip()
 
+        if not content:
+            return []
+
+        obj = json.loads(content)
+        if isinstance(obj, list):
+            return [x for x in obj if isinstance(x, dict)]
+        if isinstance(obj, dict):
+            return [obj]
+
+        raise ValueError(f"Format file tidak dikenali: {path}")
+
+    @staticmethod
+    def _write_json(data: Any, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
     @staticmethod
     def _extract_house_id(record: Dict[str, Any]) -> str:
         if record.get("house_id"):
@@ -100,12 +110,37 @@ class LabelStudioMetadataReconciler:
             notes = record.get("anomaly_notes_text")
 
         if notes is None:
+            data = record.get("data", {})
+            if isinstance(data, dict):
+                notes = data.get("anomaly_notes") or data.get("anomaly_notes_text")
+
+        if notes is None:
             return ""
 
         if isinstance(notes, list):
             return " | ".join(str(x) for x in notes)
 
         return str(notes)
+
+    @staticmethod
+    def _parse_anomaly_flags(notes: str) -> Set[str]:
+        text = (notes or "").lower()
+        flags: Set[str] = set()
+
+        patterns = {
+            "anomali_1": [r"\banomali[_\s-]?1\b", r"\banomaly[_\s-]?1\b"],
+            "anomali_2": [r"\banomali[_\s-]?2\b", r"\banomaly[_\s-]?2\b"],
+            "anomali_3": [r"\banomali[_\s-]?3\b", r"\banomaly[_\s-]?3\b"],
+            "anomali_4": [r"\banomali[_\s-]?4\b", r"\banomaly[_\s-]?4\b"],
+        }
+
+        for name, pats in patterns.items():
+            for pat in pats:
+                if re.search(pat, text):
+                    flags.add(name)
+                    break
+
+        return flags
 
     @staticmethod
     def _normalize_choice(value: Any, field_name: str) -> Any:
@@ -126,41 +161,29 @@ class LabelStudioMetadataReconciler:
         return text
 
     @staticmethod
-    def _parse_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Support format nested predictions juga, walau labelstudio_output Anda
-        yang sekarang flat.
-        """
-        choices_by_name: Dict[str, Any] = {}
-        image_status_by_name: Dict[str, str] = {}
-
-        for pred in predictions or []:
-            results = pred.get("result", [])
-            if not isinstance(results, list):
-                continue
-
-            for r in results:
-                if not isinstance(r, dict):
-                    continue
-
-                from_name = str(r.get("from_name", "")).strip()
-                r_type = str(r.get("type", "")).strip().lower()
-                value = r.get("value", {})
-
-                if r_type == "choices" and isinstance(value, dict):
-                    choices = value.get("choices", [])
-                    if isinstance(choices, list) and choices:
-                        choices_by_name[from_name] = choices[0]
-
-                if from_name.endswith("_status") and isinstance(value, dict):
-                    choices = value.get("choices", [])
-                    if isinstance(choices, list) and choices:
-                        image_status_by_name[from_name] = str(choices[0]).strip().upper()
-
-        return {
-            "choices_by_name": choices_by_name,
-            "image_status_by_name": image_status_by_name,
+    def _normalize_meta_house_type(house_type: str) -> str:
+        ht = str(house_type).strip().lower()
+        mapping = {
+            "multi": "multi",
+            "exterior_only": "single_exterior_only",
+            "interior_only": "single_interior_only",
+            "single_exterior_only": "single_exterior_only",
+            "single_interior_only": "single_interior_only",
         }
+        return mapping.get(ht, ht)
+
+    @staticmethod
+    def _normalize_labelstudio_house_type(house_type: Any) -> str:
+        ht = str(house_type).strip().lower()
+        mapping = {
+            "multi": "multi",
+            "single": "multi",
+            "exterior_only": "single_exterior_only",
+            "interior_only": "single_interior_only",
+            "single_exterior_only": "single_exterior_only",
+            "single_interior_only": "single_interior_only",
+        }
+        return mapping.get(ht, "")
 
     @staticmethod
     def _load_sample_index(sample_records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -182,19 +205,6 @@ class LabelStudioMetadataReconciler:
         }
 
     @staticmethod
-    def _infer_house_type_from_images(images: List[Dict[str, Any]]) -> str:
-        has_exterior = any(str(img.get("view_type", "")).strip().lower() == "exterior" for img in images)
-        has_interior = any(str(img.get("view_type", "")).strip().lower() == "interior" for img in images)
-
-        if has_exterior and has_interior:
-            return "multi"
-        if has_exterior:
-            return "single_exterior_only"
-        if has_interior:
-            return "single_interior_only"
-        return ""
-
-    @staticmethod
     def _flip_view_type(view_type: str) -> str:
         vt = str(view_type).strip().lower()
         if vt == "exterior":
@@ -210,29 +220,7 @@ class LabelStudioMetadataReconciler:
         return str(status).strip().upper() == "KEEP"
 
     @staticmethod
-    def _needs_view_type_flip(notes: str) -> bool:
-        notes = notes.lower()
-        return ("anomali_1" in notes) or ("anomali_2" in notes)
-
-    @staticmethod
-    def _normalize_meta_house_type(house_type: str) -> str:
-        ht = str(house_type).strip().lower()
-        mapping = {
-            "multi": "multi",
-            "exterior_only": "single_exterior_only",
-            "interior_only": "single_interior_only",
-            "single_exterior_only": "single_exterior_only",
-            "single_interior_only": "single_interior_only",
-        }
-        return mapping.get(ht, ht)
-
-    @staticmethod
     def _resolve_slot_fields(record: Dict[str, Any]) -> Dict[Tuple[str, int], Dict[str, Any]]:
-        """
-        Extract fields like:
-        ext_img_1, ext_img_1_id, ext_img_1_exists, ext_img_1_status
-        from a flat labelstudio record.
-        """
         slot_pattern = re.compile(r"^(ext|int)_img_(\d+)_(db|id|exists|status)$", re.IGNORECASE)
 
         slot_buckets: Dict[Tuple[str, int], Dict[str, Any]] = {}
@@ -250,7 +238,10 @@ class LabelStudioMetadataReconciler:
 
         return slot_buckets
 
-    def _build_source_lookup(self, source_images: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    def _build_source_lookup(
+        self,
+        source_images: List[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
         src_by_db_url: Dict[str, Dict[str, Any]] = {}
         src_by_id: Dict[str, Dict[str, Any]] = {}
 
@@ -268,18 +259,49 @@ class LabelStudioMetadataReconciler:
 
         return src_by_db_url, src_by_id
 
-    def _collect_slot_images(
+    def _extract_house_type_from_ls(self, ls_record: Dict[str, Any]) -> str:
+        candidates = [
+            ls_record.get("house_type_valid"),
+            ls_record.get("house_type"),
+        ]
+
+        data = ls_record.get("data", {})
+        if isinstance(data, dict):
+            candidates.append(data.get("house_type"))
+
+        for c in candidates:
+            normalized = self._normalize_labelstudio_house_type(c)
+            if normalized:
+                return normalized
+
+        return ""
+
+    @staticmethod
+    def _infer_house_type_from_images(images: List[Dict[str, Any]]) -> str:
+        has_exterior = any(str(img.get("view_type", "")).strip().lower() == "exterior" for img in images)
+        has_interior = any(str(img.get("view_type", "")).strip().lower() == "interior" for img in images)
+
+        if has_exterior and has_interior:
+            return "multi"
+        if has_exterior:
+            return "single_exterior_only"
+        if has_interior:
+            return "single_interior_only"
+        return ""
+
+    @staticmethod
+    def _resolve_view_mode(anomaly_flags: Set[str]) -> str:
+        # Hanya anomaly swap yang perlu flip view type.
+        if "anomali_1" in anomaly_flags or "anomali_2" in anomaly_flags:
+            return "flip"
+        return "normal"
+
+    def _collect_kept_images(
         self,
         ls_record: Dict[str, Any],
         source_record: Dict[str, Any],
-        anomaly_notes: str,
+        view_mode: str,
     ) -> List[Dict[str, Any]]:
-        """
-        Build final images from flat Label Studio record.
-        Keep only images with status KEEP.
-        image_path and image_ori_url are taken from old metadata directly
-        by matching image_id or image_db_url.
-        """
         source_images = source_record.get("images", [])
         if isinstance(source_images, str):
             try:
@@ -294,7 +316,6 @@ class LabelStudioMetadataReconciler:
         slots = sorted(slot_buckets.values(), key=lambda x: (0 if x["prefix"] == "ext" else 1, x["idx"]))
 
         final_images: List[Dict[str, Any]] = []
-        flip_view_type = self._needs_view_type_flip(anomaly_notes)
 
         for slot in slots:
             prefix = slot["prefix"]
@@ -303,7 +324,6 @@ class LabelStudioMetadataReconciler:
             db_url = str(slot.get("db", "") or "").strip()
             img_id = str(slot.get("id", "") or "").strip()
 
-            # exists bisa yes/no, kalau kosong maka infer dari ada/tidaknya db_url atau image_id
             exists_raw = slot.get("exists")
             if exists_raw is None:
                 exists = bool(db_url or img_id)
@@ -313,8 +333,7 @@ class LabelStudioMetadataReconciler:
             if not exists:
                 continue
 
-            slot_name = f"{prefix}_img_{idx}"
-            status_name = f"{slot_name}_status"
+            status_name = f"{prefix}_img_{idx}_status"
             status = ls_record.get(status_name)
             if not self._is_keep(status):
                 continue
@@ -325,7 +344,6 @@ class LabelStudioMetadataReconciler:
             elif img_id and img_id in src_by_id:
                 matched_source = src_by_id[img_id]
 
-            # fallback tetap pakai nilai dari metadata lama bila tidak ada match by db_url/id
             if matched_source is None:
                 matched_source = {
                     "image_id": img_id or "",
@@ -337,14 +355,11 @@ class LabelStudioMetadataReconciler:
 
             cloned = self._clone_image(matched_source)
 
-            # anomaly_1 dan anomaly_2 sama-sama perlu flip view_type
-            if flip_view_type:
+            if view_mode == "flip":
                 cloned["view_type"] = self._flip_view_type("exterior" if prefix == "int" else "interior")
             else:
                 cloned["view_type"] = "exterior" if prefix == "ext" else "interior"
 
-            # pastikan image_path dan image_ori_url tetap diambil dari metadata lama
-            # jika match tidak ketemu, fallback ke value dari Label Studio
             if not cloned.get("image_db_url"):
                 cloned["image_db_url"] = db_url
             if not cloned.get("image_path"):
@@ -354,40 +369,20 @@ class LabelStudioMetadataReconciler:
 
             final_images.append(cloned)
 
-        # support extra images jika ada
-        for extra_key, default_view in [("extra_ext_images", "exterior"), ("extra_int_images", "interior")]:
-            extra_images = ls_record.get(extra_key, [])
-            if isinstance(extra_images, str):
-                try:
-                    extra_images = json.loads(extra_images)
-                except Exception:
-                    extra_images = []
-            if not isinstance(extra_images, list):
-                continue
-
-            for img in extra_images:
-                if not isinstance(img, dict):
-                    continue
-
-                status = str(img.get("status", "KEEP")).strip().upper()
-                if status == "DELETE":
-                    continue
-
-                view_type = str(img.get("view_type") or default_view).strip().lower()
-                if flip_view_type:
-                    view_type = self._flip_view_type(view_type)
-
-                final_images.append(
-                    {
-                        "image_id": img.get("image_id", ""),
-                        "image_path": img.get("image_path", ""),
-                        "image_ori_url": img.get("image_ori_url", ""),
-                        "image_db_url": img.get("image_db_url", ""),
-                        "view_type": view_type,
-                    }
-                )
-
         return final_images
+
+    @staticmethod
+    def _infer_house_type_from_kept_images(images: List[Dict[str, Any]]) -> str:
+        has_exterior = any(str(img.get("view_type", "")).strip().lower() == "exterior" for img in images)
+        has_interior = any(str(img.get("view_type", "")).strip().lower() == "interior" for img in images)
+
+        if has_exterior and has_interior:
+            return "multi"
+        if has_exterior:
+            return "single_exterior_only"
+        if has_interior:
+            return "single_interior_only"
+        return ""
 
     def _reconcile_actual_label(
         self,
@@ -415,7 +410,6 @@ class LabelStudioMetadataReconciler:
         dinding = get_choice("dinding", "jenis_dinding_terluas")
         lantai = get_choice("lantai", "jenis_lantai_terluas")
 
-        # otomatis menyesuaikan skema final
         if final_house_type == "single_exterior_only":
             lantai = "Tidak terdeteksi"
         elif final_house_type == "single_interior_only":
@@ -428,13 +422,19 @@ class LabelStudioMetadataReconciler:
             "lantai": lantai,
         }
 
+    @staticmethod
+    def _null_status_object() -> Dict[str, None]:
+        return {
+            "atap": None,
+            "dinding": None,
+            "lantai": None,
+        }
+
     def reconcile(self) -> Dict[str, Any]:
-        sample_records = self._read_jsonl(self.config.sample_metadata_path)
+        sample_records = self._read_json_records(self.config.metadata_path)
         sample_index = self._load_sample_index(sample_records)
 
-        labelstudio_items = self._read_json(self.config.labelstudio_output_path)
-        if isinstance(labelstudio_items, dict):
-            labelstudio_items = [labelstudio_items]
+        labelstudio_items = self._read_json_records(self.config.labelstudio_output_path)
 
         labelstudio_index: Dict[str, Dict[str, Any]] = {}
         for item in labelstudio_items:
@@ -457,14 +457,22 @@ class LabelStudioMetadataReconciler:
             matched += 1
 
             anomaly_notes = self._get_anomaly_notes(ls_item)
-            final_images = self._collect_slot_images(
+            anomaly_flags = self._parse_anomaly_flags(anomaly_notes)
+
+            view_mode = self._resolve_view_mode(anomaly_flags)
+
+            kept_images = self._collect_kept_images(
                 ls_record=ls_item,
                 source_record=source_record,
-                anomaly_notes=anomaly_notes,
+                view_mode=view_mode,
             )
 
-            final_house_type = self._infer_house_type_from_images(final_images)
-            if final_house_type == "":
+            # Jika single dihapus semua, rumah dibuang
+            if not kept_images:
+                continue
+
+            final_house_type = self._infer_house_type_from_kept_images(kept_images)
+            if not final_house_type:
                 continue
 
             final_house_type = self._normalize_meta_house_type(final_house_type)
@@ -474,18 +482,14 @@ class LabelStudioMetadataReconciler:
                 "no_kk": source_record.get("no_kk"),
                 "house_type": final_house_type,
                 "split": source_record.get("split", None),
-                "match": source_record.get("match", None),
-                "images": final_images,
+                "images": kept_images,
                 "actual_label": self._reconcile_actual_label(
                     ls_record=ls_item,
                     final_house_type=final_house_type,
                     source_record=source_record,
                 ),
-                "dtsen": {
-                    "atap": None,
-                    "dinding": None,
-                    "lantai": None,
-                },
+                "dtsen": self._null_status_object(),
+                "status": self._null_status_object(),
             }
 
             reconciled_records.append(reconciled_record)

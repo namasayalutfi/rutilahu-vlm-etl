@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,8 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 @dataclass
 class LabelStudioConfig:
-    input_jsonl: Path = Path("metadata_sample/sample_metadata_augmented.jsonl")
-    output_json: Path = Path("metadata/labelstudio_metadata_input.json")
+    input_json: Path = Path("metadata/mkn2_metadata_merged.json")
+    output_json: Path = Path("data/labelstudio_input.json")
 
 
 class LabelStudioMetadataGenerator:
@@ -18,10 +17,26 @@ class LabelStudioMetadataGenerator:
         self.config = config or LabelStudioConfig()
 
     @staticmethod
-    def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    def _read_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
         if not path.exists():
             raise FileNotFoundError(f"File tidak ditemukan: {path}")
 
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+
+        if not content:
+            return []
+
+        # JSON array / JSON object
+        if content.startswith("[") or content.startswith("{"):
+            obj = json.loads(content)
+            if isinstance(obj, list):
+                return obj
+            if isinstance(obj, dict):
+                return [obj]
+            raise ValueError(f"Format JSON tidak dikenali: {path}")
+
+        # Fallback JSONL
         records: List[Dict[str, Any]] = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -31,13 +46,22 @@ class LabelStudioMetadataGenerator:
         return records
 
     @staticmethod
-    def _normalize_house_type_for_ls(house_type: str) -> str:
+    def _normalize_house_type_for_ls(house_type: Optional[str]) -> str:
         mapping = {
             "multi": "multi",
-            "single_exterior_only": "exterior_only",
-            "single_interior_only": "interior_only",
+            "single_exterior_only": "single_exterior_only",
+            "single_interior_only": "single_interior_only",
+            "single": "single_exterior_only",
         }
-        return mapping.get(str(house_type).strip().lower(), "multi")
+
+        if house_type is None:
+            return "multi"
+
+        text = str(house_type).strip().lower()
+        if not text or text in {"none", "null"}:
+            return "multi"
+
+        return mapping.get(text, "multi")
 
     @staticmethod
     def _normalize_choice_text(value: Any) -> Optional[str]:
@@ -54,12 +78,7 @@ class LabelStudioMetadataGenerator:
         field_name: str,
         house_type: str,
     ) -> str:
-        """
-        Convert actual_label values from sample_metadata_augmented.jsonl
-        into Label Studio choice strings.
-        """
         normalized = LabelStudioMetadataGenerator._normalize_choice_text(value)
-
         if normalized is not None:
             return normalized
         return "Belum Diisi"
@@ -91,15 +110,26 @@ class LabelStudioMetadataGenerator:
         return exterior_images, interior_images
 
     @staticmethod
+    def _infer_house_type_from_images(record: Dict[str, Any]) -> str:
+        exterior_images, interior_images = LabelStudioMetadataGenerator._get_images_by_view(record)
+
+        has_exterior = len(exterior_images) > 0
+        has_interior = len(interior_images) > 0
+
+        if has_exterior and has_interior:
+            return "multi"
+        if has_exterior:
+            return "single_exterior_only"
+        if has_interior:
+            return "single_interior_only"
+
+        return "multi"
+
+    @staticmethod
     def _slot_image_data(
         images: List[Dict[str, Any]],
         idx: int,
     ) -> Tuple[str, str]:
-        """
-        Return (image_url, image_id) for slot index:
-        idx=0 -> first image
-        idx=1 -> second image
-        """
         if idx >= len(images):
             return "", ""
 
@@ -119,9 +149,15 @@ class LabelStudioMetadataGenerator:
             },
         }
 
+    def _resolve_house_type(self, record: Dict[str, Any]) -> str:
+        raw_house_type = record.get("house_type")
+        if raw_house_type is None or str(raw_house_type).strip().lower() in {"", "none", "null"}:
+            return self._infer_house_type_from_images(record)
+        return str(raw_house_type).strip().lower()
+
     def _build_data_block(self, record: Dict[str, Any]) -> Dict[str, Any]:
         house_id = record.get("house_id", "")
-        house_type = str(record.get("house_type", "")).strip().lower()
+        house_type = self._resolve_house_type(record)
 
         exterior_images, interior_images = self._get_images_by_view(record)
 
@@ -130,24 +166,20 @@ class LabelStudioMetadataGenerator:
         int_img_1_db, int_img_1_id = self._slot_image_data(interior_images, 0)
         int_img_2_db, int_img_2_id = self._slot_image_data(interior_images, 1)
 
-
         return {
             "house_id": house_id,
             "house_type": self._normalize_house_type_for_ls(house_type),
 
-            # image existence controllers for Label Studio UI
             "ext_img_1_exists": "yes" if len(exterior_images) >= 1 else "no",
             "ext_img_2_exists": "yes" if len(exterior_images) >= 2 else "no",
             "int_img_1_exists": "yes" if len(interior_images) >= 1 else "no",
             "int_img_2_exists": "yes" if len(interior_images) >= 2 else "no",
 
-            # image URLs shown in LS
             "ext_img_1": ext_img_1_db,
             "ext_img_2": ext_img_2_db,
             "int_img_1": int_img_1_db,
             "int_img_2": int_img_2_db,
 
-            # image IDs for tracking
             "ext_img_1_id": ext_img_1_id,
             "ext_img_2_id": ext_img_2_id,
             "int_img_1_id": int_img_1_id,
@@ -155,7 +187,8 @@ class LabelStudioMetadataGenerator:
         }
 
     def _build_predictions(self, record: Dict[str, Any]) -> List[Dict[str, Any]]:
-        house_type = str(record.get("house_type", "")).strip().lower()
+        house_type = self._resolve_house_type(record)
+
         actual_label = record.get("actual_label", {})
         if isinstance(actual_label, str):
             try:
@@ -170,7 +203,6 @@ class LabelStudioMetadataGenerator:
 
         result: List[Dict[str, Any]] = []
 
-        # House type
         result.append(
             self._build_choice_result(
                 from_name="house_type_valid",
@@ -179,13 +211,11 @@ class LabelStudioMetadataGenerator:
             )
         )
 
-        # Image existence controllers
         result.append(self._build_choice_result("ext_img_1_exists_ctrl", "house_anchor", "yes" if len(exterior_images) >= 1 else "no"))
         result.append(self._build_choice_result("ext_img_2_exists_ctrl", "house_anchor", "yes" if len(exterior_images) >= 2 else "no"))
         result.append(self._build_choice_result("int_img_1_exists_ctrl", "house_anchor", "yes" if len(interior_images) >= 1 else "no"))
         result.append(self._build_choice_result("int_img_2_exists_ctrl", "house_anchor", "yes" if len(interior_images) >= 2 else "no"))
 
-        # Material labels
         result.append(
             self._build_choice_result(
                 "jenis_atap_terluas",
@@ -208,7 +238,6 @@ class LabelStudioMetadataGenerator:
             )
         )
 
-        # KEEP defaults for all visible images
         if len(exterior_images) >= 1:
             result.append(self._build_choice_result("ext_img_1_status", "ext_img_1", "KEEP"))
         if len(exterior_images) >= 2:
@@ -221,7 +250,7 @@ class LabelStudioMetadataGenerator:
         return result
 
     def run(self) -> Path:
-        records = self._read_jsonl(self.config.input_jsonl)
+        records = self._read_json_or_jsonl(self.config.input_json)
 
         output_items: List[Dict[str, Any]] = []
         for record in records:

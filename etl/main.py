@@ -16,14 +16,20 @@ from etl.sample_metadata_from_multi import DinsosHouseMetadataSampler
 from etl.augment_sample_metadata_from_crawling import AugmentConfig, SampleMetadataAugmentor
 from etl.generate_labelstudio_metadata_input import LabelStudioConfig, LabelStudioMetadataGenerator
 from etl.reconcile_metadata import ReconcileConfig, LabelStudioMetadataReconciler
-from etl.generate_dtsen_dummy import DTSENDummyConfig, DTSENDummyGenerator
+from etl.generate_dtsen_status_dummy import DTSENDummyConfig, DTSENDummyGenerator
 from etl.split_metadata import (
     SplitConfig,
     HouseTypeAwareHierarchicalStratifiedSplitter,
 )
-from etl.scrape_google_images import GoogleImageScraperConfig, GoogleImageUrlsExtractor
+from etl.crawl_google_images import GoogleImageCrawlerConfig, GoogleImageCrawler
+from etl.download_crawled_img import CrawledImageMinioMetadataConfig, CrawledImageMinioMetadataPipeline
+from etl.merge_sample_metadata import MergeSampleMetadataConfig, SampleMetadataMerger
+from etl.split_labelstudio_input import LabelStudioInputSplitter, LabelStudioSplitConfig
+from etl.merge_labelstudio_outputs import LabelStudioMergeConfig, LabelStudioOutputMerger
+from etl.merge_two_metadata import MergeConfig, MetadataMerger
 
 class RutilahuETLPipeline:
+
     def __init__(self):
         self.extractor = DinsosHouseImagesExtractor()
         self.downloader = DinsosHouseDownloadMetadataPipeline()
@@ -31,13 +37,7 @@ class RutilahuETLPipeline:
         self.labelstudio_generator = LabelStudioMetadataGenerator(LabelStudioConfig())
         self.reconciler = LabelStudioMetadataReconciler(ReconcileConfig())
         self.dtsen_generator = DTSENDummyGenerator(DTSENDummyConfig())
-        self.image_scraper = GoogleImageUrlsExtractor(
-            GoogleImageScraperConfig(
-                data_dir=PROJECT_ROOT / "data",
-                output_dir=PROJECT_ROOT / "data" / "scraped_urls", # Output disatukan di folder baru dalam data
-                max_scrolls=3
-            )
-        )
+
         self.splitter = HouseTypeAwareHierarchicalStratifiedSplitter(
             SplitConfig(
                 input_path=Path("metadata_sample/reconciled_sample_metadata_with_dtsen.json"),
@@ -46,12 +46,62 @@ class RutilahuETLPipeline:
                 val_ratio=0.1,
                 test_ratio=0.1,
                 seed=42,
+            )
         )
-        
-    )
 
+        self.image_crawler = GoogleImageCrawler(
+            GoogleImageCrawlerConfig(
+                keyword_dir=PROJECT_ROOT / "data" / "keywords_test",
+                output_dir=PROJECT_ROOT / "data" / "crawled_urls_mkn2",
+                max_urls_per_keyword=200,
+                headless=True,
+                file_workers=2,
+                keyword_workers=1,
+                stagger_delay_min=0.5,
+                stagger_delay_max=2.0,
+                thumbnails_to_click = 50,
+                click_delay_min = 0.1,
+                click_delay_max = 0.3,
+            )
+        )
+        self.crawled_image_pipeline = CrawledImageMinioMetadataPipeline(
+            CrawledImageMinioMetadataConfig(
+                crawler_output_dir=PROJECT_ROOT / "data" / "crawler_outputs",
+                output_metadata_path=PROJECT_ROOT / "metadata" / "crawled_img_metadata.json",
+                workers=8,
+            )
+        )
+        self.sample_metadata_merger = SampleMetadataMerger(
+            MergeSampleMetadataConfig(
+                metadata_jsonl_path=PROJECT_ROOT / "metadata" / "metadata.jsonl",
+                crawled_metadata_path=PROJECT_ROOT / "metadata" / "crawled_img_metadata.json",
+                output_path=PROJECT_ROOT / "metadata" / "mkn2_metadata_merged.json",
+            )
+        )
+        self.labelstudio_splitter = LabelStudioInputSplitter(
+            LabelStudioSplitConfig(
+                input_json=PROJECT_ROOT / "data" / "labelstudio_input.json",
+                output_dir=PROJECT_ROOT / "data" / "labelstudio_input_split",
+                num_splits=8,
+                seed=42,
+            )
+        )
+        self.labelstudio_output_merger = LabelStudioOutputMerger(
+            LabelStudioMergeConfig(
+                input_dir=PROJECT_ROOT / "data" / "labelstudio_output_split",
+                output_json=PROJECT_ROOT / "data" / "labelstudio_output_merged.json",
+                recursive=False,
+            )
+        )
+        self.two_metadata_merger = MetadataMerger(
+            MergeConfig(
+                reconciled_metadata_path=PROJECT_ROOT / "metadata" / "reconciled_mkn2_metadata.json",
+                mkn2_metadata_path=PROJECT_ROOT / "metadata" / "mkn2_metadata.json",
+                output_path=PROJECT_ROOT / "metadata" / "mkn2_metadata_final.json",
+                dedupe_by_house_id=False,
+            )
+        )
         self._sampler = None
-
 
     @property
     def sampler(self):
@@ -80,7 +130,7 @@ class RutilahuETLPipeline:
         print("[OK] Augment sample metadata selesai.")
         for k, v in result.items():
             print(f"{k}: {v}")
-    
+
     def run_build_labelstudio_input(self) -> None:
         out_path = self.labelstudio_generator.run()
         print(f"[OK] Label Studio metadata generated: {out_path}")
@@ -128,15 +178,53 @@ class RutilahuETLPipeline:
         for schema, schema_dist in result["combo_distribution_by_schema"].items():
             print(f"  {schema}: {schema_dist}")
 
-    def run_scrape_images(self) -> None:
-        result = self.image_scraper.run()
-        print("\n[OK] Scraping URL Google Images selesai.")
+
+    def run_crawl_images(self) -> None:
+        """Crawl image URL dari Google Images berdasarkan semua file keyword."""
+        results = self.image_crawler.run()
+        print("[OK] Crawling Google Images selesai.")
+        for kw_file, out_path in results.items():
+            print(f"  {kw_file} → {out_path}")
+
+    def run_build_crawled_img_metadata(self) -> None:
+        result = self.crawled_image_pipeline.run()
+        print("[OK] Crawled image download + MinIO upload + metadata selesai.")
         for k, v in result.items():
-            print(f"File {k}: Berhasil mengekstrak {v} URL.")
+            print(f"{k}: {v}")
+
+    def run_merge_sample_metadata(self) -> None:
+        result = self.sample_metadata_merger.merge()
+        print("[OK] Merge sample metadata selesai.")
+        for k, v in result.items():
+            print(f"{k}: {v}")
+
+    def run_split_labelstudio_input(self) -> None:
+        result = self.labelstudio_splitter.run()
+        print("[OK] Split labelstudio_input selesai.")
+        print(f"total_records: {result['total_records']}")
+        print(f"output_dir: {result['output_dir']}")
+        print("split_sizes:")
+        for k, v in result["split_sizes"].items():
+            print(f"  {k}: {v}")
+
+    def run_merge_labelstudio_outputs(self) -> None:
+        result = self.labelstudio_output_merger.merge()
+        print("[OK] Merge labelstudio outputs selesai.")
+        print(f"input_dir: {result['input_dir']}")
+        print(f"output_json: {result['output_json']}")
+        print(f"total_files: {result['total_files']}")
+        print(f"total_records: {result['total_records']}")
+        print("per_file_counts:")
+        for k, v in result["per_file_counts"].items():
+            print(f"  {k}: {v}")
+
+    def run_merge_two_metadata(self) -> None:
+        result = self.two_metadata_merger.merge()
+        print("[OK] Merge dua metadata selesai.")
+        for k, v in result.items():
+            print(f"{k}: {v}")
 
     def run_all(self) -> None:
-        # extract dijalankan di local,
-        # sedangkan download + metadata + sampling dijalankan di server.
         self.run_download_and_metadata()
         self.run_sample_metadata()
         self.run_augment_sample_metadata()
@@ -144,6 +232,7 @@ class RutilahuETLPipeline:
         self.run_reconcile_metadata()
         self.run_generate_dtsen_dummy()
         self.run_split_metadata()
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Rutilahu ETL Pipeline")
@@ -184,9 +273,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Split metadata menjadi train/val/test dengan house_type-aware iterative stratification",
     )
     parser.add_argument(
-        "--scrape_images",
+        "--crawl_images",
         action="store_true",
-        help="Jalankan scraping image url di Google secara headless",
+        help="Crawl image URL dari Google Images berdasarkan file keyword di data/",
+    )
+    parser.add_argument(
+        "--build_crawled_img_metadata",
+        action="store_true",
+        help="Download image hasil crawl, upload ke MinIO, dan buat metadata",
+    )
+    parser.add_argument(
+        "--merge_metadata",
+        action="store_true",
+        help="Gabungkan mkn2_metadata.json + filtered metadata.jsonl + crawled_img_metadata.json",
+    )
+    parser.add_argument(
+        "--split_labelstudio_input",
+        action="store_true",
+        help="Pecah labelstudio_input.json menjadi 8 file JSON merata",
+    )
+    parser.add_argument(
+        "--merge_labelstudio_outputs",
+        action="store_true",
+        help="Merge semua file JSON output Label Studio dari folder split",
+    )
+    parser.add_argument(
+        "--merge_two_metadata",
+        action="store_true",
+        help="Merge reconciled_mkn2_metadata.json dan mkn2_metadata.json",
     )
     parser.add_argument("--all", action="store_true", help="Jalankan keseluruhan pipeline ETL")
     return parser
@@ -227,7 +341,7 @@ def main():
     if args.reconcile_metadata:
         pipeline.run_reconcile_metadata()
         did_run = True
-        
+
     if args.generate_dtsen_dummy:
         pipeline.run_generate_dtsen_dummy()
         did_run = True
@@ -236,10 +350,30 @@ def main():
         pipeline.run_split_metadata()
         did_run = True
 
-    if args.scrape_images:
-        pipeline.run_scrape_images()
+    if args.crawl_images:
+        pipeline.run_crawl_images()
         did_run = True
-        
+
+    if args.build_crawled_img_metadata:
+        pipeline.run_build_crawled_img_metadata()
+        did_run = True
+
+    if args.merge_metadata:
+        pipeline.run_merge_metadata()
+        did_run = True
+    
+    if args.split_labelstudio_input:
+        pipeline.run_split_labelstudio_input()
+        did_run = True
+
+    if args.merge_labelstudio_outputs:
+        pipeline.run_merge_labelstudio_outputs()
+        did_run = True  
+    
+    if args.merge_two_metadata:
+        pipeline.run_merge_two_metadata()
+        did_run = True
+
     if not did_run:
         parser.print_help()
 
