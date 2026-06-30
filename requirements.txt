@@ -3,8 +3,6 @@ pandas
 openpyxl
 minio
 python-dotenv
-torch>=2.12.0
-torchvision>=0.22.0
 git+https://github.com/openai/CLIP.git
 qdrant-client
 Pillow

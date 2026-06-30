@@ -1,7 +1,8 @@
+import gc
 import io
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Iterator, Optional
 
 import requests
 from PIL import Image
@@ -18,6 +19,7 @@ from config import (
     USE_MINIO_SDK,
 )
 
+# ── Opsional: MinIO SDK ──────────────────────────────────────────────────────
 if USE_MINIO_SDK:
     try:
         from minio import Minio
@@ -34,6 +36,7 @@ if USE_MINIO_SDK:
         USE_MINIO_SDK = False
 
 
+# ── Download single image ────────────────────────────────────────────────────
 
 def _download_via_http(url: str) -> Optional[Image.Image]:
     """Download gambar via HTTP GET dengan retry."""
@@ -83,14 +86,85 @@ def download_image(record: dict) -> tuple[str, Optional[Image.Image]]:
     return image_id, img
 
 
-# ── Batch download dengan thread pool ────────────────────────────────────────
+# ── STREAMING: download per-chunk (RECOMMENDED untuk dataset besar) ─────────
+
+def chunk_records(records: list[dict], chunk_size: int) -> Iterator[list[dict]]:
+    """Pecah list records jadi beberapa chunk kecil."""
+    for i in range(0, len(records), chunk_size):
+        yield records[i: i + chunk_size]
+
+
+def download_images_streaming(
+    records: list[dict],
+    chunk_size: int,
+    workers: int = DOWNLOAD_WORKERS,
+) -> Iterator[tuple[dict[str, Image.Image], list[str]]]:
+    """
+    Download gambar secara streaming, per-chunk kecil.
+
+    Generator ini yield (chunk_results, chunk_failed) setiap kali satu chunk
+    selesai didownload. Memory hanya menahan 1 chunk pada satu waktu — chunk
+    sebelumnya otomatis bisa di-garbage-collect oleh caller setelah dipakai
+    (misal setelah di-encode oleh CLIP).
+
+    Args:
+        records    : seluruh image records yang mau didownload
+        chunk_size : jumlah gambar per chunk (mis. 200). Sesuaikan dengan RAM.
+        workers    : jumlah thread paralel PER CHUNK
+
+    Yield:
+        (results, failed) untuk setiap chunk:
+            results : dict { image_id → PIL.Image }
+            failed  : list image_id yang gagal didownload
+    """
+    total_chunks = (len(records) + chunk_size - 1) // chunk_size
+    total_done   = 0
+    total_failed = 0
+
+    print(f"[image_loader] Streaming download: {len(records)} gambar, "
+          f"{total_chunks} chunk (chunk_size={chunk_size}, workers={workers})")
+
+    for chunk_idx, chunk in enumerate(chunk_records(records, chunk_size), start=1):
+        results: dict[str, Image.Image] = {}
+        failed: list[str] = []
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(download_image, rec): rec for rec in chunk}
+            for future in as_completed(futures):
+                image_id, img = future.result()
+                if img is not None:
+                    results[image_id] = img
+                else:
+                    failed.append(image_id)
+
+        total_done   += len(results)
+        total_failed += len(failed)
+
+        print(f"[image_loader] Chunk {chunk_idx}/{total_chunks} selesai "
+              f"({len(results)} ok, {len(failed)} gagal) | "
+              f"Total progress: {total_done + total_failed}/{len(records)} "
+              f"(berhasil: {total_done}, gagal: {total_failed})")
+
+        yield results, failed
+
+        # Bersihkan referensi chunk ini sebelum lanjut ke chunk berikutnya.
+        # Caller (embedder) seharusnya sudah selesai pakai `results` di titik ini.
+        del results, failed
+        gc.collect()
+
+
+# ── LEGACY: download semua sekaligus (HINDARI untuk dataset besar) ──────────
 
 def download_images_batch(
     records: list[dict],
     workers: int = DOWNLOAD_WORKERS,
 ) -> dict[str, Image.Image]:
     """
-    Download semua gambar secara paralel.
+    [LEGACY] Download semua gambar secara paralel, ditahan di RAM sekaligus.
+
+    !! PERINGATAN: untuk dataset > beberapa ribu gambar, fungsi ini bisa
+    menghabiskan puluhan GB RAM dan menyebabkan crash. Gunakan
+    `download_images_streaming()` untuk dataset besar.
 
     Return: dict { image_id → PIL.Image }
     Gambar yang gagal didownload tidak dimasukkan ke dict.

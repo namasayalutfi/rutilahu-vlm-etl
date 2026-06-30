@@ -1,0 +1,47 @@
+# =============================================================================
+# docker-compose.yml — Qdrant untuk pipeline duplicate detection
+# Disesuaikan untuk: Windows (Docker Desktop), local development
+#
+# CATATAN WINDOWS:
+#   Qdrant dengan bind mount (./qdrant_storage:/qdrant/storage) di Windows
+#   diketahui bisa menyebabkan storage corruption via Docker/WSL.
+#   File ini menggunakan named volume (qdrant_data) sebagai solusinya.
+#
+# CARA PAKAI:
+#   docker compose up -d          # jalankan di background
+#   docker compose down           # stop container (data tetap tersimpan)
+#   docker compose down -v        # stop + hapus semua data (fresh start)
+#   docker compose logs -f        # lihat log realtime
+# =============================================================================
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-dedup
+    restart: unless-stopped        # auto-restart jika Docker Desktop restart
+
+    ports:
+      - "6333:6333"                # REST API + Web Dashboard
+      - "6334:6334"                # gRPC (tidak dipakai pipeline kita, tapi dibuka untuk belajar)
+
+    volumes:
+      # Named volume — aman di Windows, tidak ada risiko corruption
+      - qdrant_data:/qdrant/storage
+
+    environment:
+      # Log level: DEBUG untuk belajar, INFO untuk production
+      QDRANT__LOG_LEVEL: INFO
+
+    # Health check — pastikan Qdrant benar-benar siap sebelum pipeline jalan
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# Named volume — dikelola oleh Docker, data tersimpan di Docker volume store
+# Lokasi aktual di Windows: \\wsl$\docker-desktop-data\data\docker\volumes\
+volumes:
+  qdrant_data:
+    name: rutilahu_qdrant_data     # nama eksplisit agar mudah diidentifikasi

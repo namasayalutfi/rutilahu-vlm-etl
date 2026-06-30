@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 @dataclass
 class LabelStudioConfig:
-    input_json: Path = Path("metadata/mkn2_metadata_merged.json")
-    output_json: Path = Path("data/labelstudio_input.json")
+    input_json: Path = Path("metadata/mkn2_test_metadata.json")
+    output_json: Path = Path("data/mkn2_data_test_input.json")
 
 
 class LabelStudioMetadataGenerator:

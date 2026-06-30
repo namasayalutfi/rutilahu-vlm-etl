@@ -61,9 +61,6 @@ class LabelStudioMetadataReconciler:
     def __init__(self, config: ReconcileConfig | None = None):
         self.config = config or ReconcileConfig()
 
-    # -----------------------------
-    # I/O
-    # -----------------------------
     @staticmethod
     def _read_json_records(path: Path) -> List[Dict[str, Any]]:
         if not path.exists():
@@ -83,15 +80,6 @@ class LabelStudioMetadataReconciler:
 
         raise ValueError(f"Format file tidak dikenali: {path}")
 
-    @staticmethod
-    def _write_json(data: Any, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    # -----------------------------
-    # Helpers
-    # -----------------------------
     @staticmethod
     def _extract_house_id(record: Dict[str, Any]) -> str:
         if record.get("house_id"):
@@ -277,7 +265,7 @@ class LabelStudioMetadataReconciler:
         return ""
 
     @staticmethod
-    def _infer_house_type_from_images(images: List[Dict[str, Any]]) -> str:
+    def _infer_house_type_from_kept_images(images: List[Dict[str, Any]]) -> str:
         has_exterior = any(str(img.get("view_type", "")).strip().lower() == "exterior" for img in images)
         has_interior = any(str(img.get("view_type", "")).strip().lower() == "interior" for img in images)
 
@@ -290,17 +278,22 @@ class LabelStudioMetadataReconciler:
         return ""
 
     @staticmethod
-    def _resolve_view_mode(anomaly_flags: Set[str]) -> str:
-        # Hanya anomaly swap yang perlu flip view type.
-        if "anomali_1" in anomaly_flags or "anomali_2" in anomaly_flags:
-            return "flip"
+    def _resolve_anomaly_mode(anomaly_flags: Set[str]) -> str:
+        """
+        anomaly_1: multi, ext/int slot tertukar -> swap slot prefix
+        anomaly_2: single, slot/view terbalik -> flip view_type image yang keep
+        """
+        if "anomali_1" in anomaly_flags:
+            return "swap_slots"
+        if "anomali_2" in anomaly_flags:
+            return "flip_kept_images"
         return "normal"
 
     def _collect_kept_images(
         self,
         ls_record: Dict[str, Any],
         source_record: Dict[str, Any],
-        view_mode: str,
+        anomaly_mode: str,
     ) -> List[Dict[str, Any]]:
         source_images = source_record.get("images", [])
         if isinstance(source_images, str):
@@ -355,8 +348,15 @@ class LabelStudioMetadataReconciler:
 
             cloned = self._clone_image(matched_source)
 
-            if view_mode == "flip":
+            if anomaly_mode == "swap_slots":
+                # anomaly_1:
+                # ext slot dianggap interior, int slot dianggap exterior
                 cloned["view_type"] = self._flip_view_type("exterior" if prefix == "int" else "interior")
+            elif anomaly_mode == "flip_kept_images":
+                # anomaly_2:
+                # image yang dipertahankan dibalik view_type-nya
+                current_view = str(cloned.get("view_type") or ("exterior" if prefix == "ext" else "interior")).strip().lower()
+                cloned["view_type"] = self._flip_view_type(current_view)
             else:
                 cloned["view_type"] = "exterior" if prefix == "ext" else "interior"
 
@@ -370,19 +370,6 @@ class LabelStudioMetadataReconciler:
             final_images.append(cloned)
 
         return final_images
-
-    @staticmethod
-    def _infer_house_type_from_kept_images(images: List[Dict[str, Any]]) -> str:
-        has_exterior = any(str(img.get("view_type", "")).strip().lower() == "exterior" for img in images)
-        has_interior = any(str(img.get("view_type", "")).strip().lower() == "interior" for img in images)
-
-        if has_exterior and has_interior:
-            return "multi"
-        if has_exterior:
-            return "single_exterior_only"
-        if has_interior:
-            return "single_interior_only"
-        return ""
 
     def _reconcile_actual_label(
         self,
@@ -424,18 +411,13 @@ class LabelStudioMetadataReconciler:
 
     @staticmethod
     def _null_status_object() -> Dict[str, None]:
-        return {
-            "atap": None,
-            "dinding": None,
-            "lantai": None,
-        }
+        return {"atap": None, "dinding": None, "lantai": None}
 
     def reconcile(self) -> Dict[str, Any]:
         sample_records = self._read_json_records(self.config.metadata_path)
         sample_index = self._load_sample_index(sample_records)
 
         labelstudio_items = self._read_json_records(self.config.labelstudio_output_path)
-
         labelstudio_index: Dict[str, Dict[str, Any]] = {}
         for item in labelstudio_items:
             if not isinstance(item, dict):
@@ -458,41 +440,38 @@ class LabelStudioMetadataReconciler:
 
             anomaly_notes = self._get_anomaly_notes(ls_item)
             anomaly_flags = self._parse_anomaly_flags(anomaly_notes)
-
-            view_mode = self._resolve_view_mode(anomaly_flags)
+            anomaly_mode = self._resolve_anomaly_mode(anomaly_flags)
 
             kept_images = self._collect_kept_images(
                 ls_record=ls_item,
                 source_record=source_record,
-                view_mode=view_mode,
+                anomaly_mode=anomaly_mode,
             )
 
-            # Jika single dihapus semua, rumah dibuang
             if not kept_images:
                 continue
 
             final_house_type = self._infer_house_type_from_kept_images(kept_images)
+            final_house_type = self._normalize_meta_house_type(final_house_type)
             if not final_house_type:
                 continue
 
-            final_house_type = self._normalize_meta_house_type(final_house_type)
-
-            reconciled_record = {
-                "house_id": source_record.get("house_id", house_id),
-                "no_kk": source_record.get("no_kk"),
-                "house_type": final_house_type,
-                "split": source_record.get("split", None),
-                "images": kept_images,
-                "actual_label": self._reconcile_actual_label(
-                    ls_record=ls_item,
-                    final_house_type=final_house_type,
-                    source_record=source_record,
-                ),
-                "dtsen": self._null_status_object(),
-                "status": self._null_status_object(),
-            }
-
-            reconciled_records.append(reconciled_record)
+            reconciled_records.append(
+                {
+                    "house_id": source_record.get("house_id", house_id),
+                    "no_kk": source_record.get("no_kk"),
+                    "house_type": final_house_type,
+                    "split": source_record.get("split", None),
+                    "images": kept_images,
+                    "actual_label": self._reconcile_actual_label(
+                        ls_record=ls_item,
+                        final_house_type=final_house_type,
+                        source_record=source_record,
+                    ),
+                    "dtsen": self._null_status_object(),
+                    "status": self._null_status_object(),
+                }
+            )
 
         self.config.output_json_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.config.output_json_path, "w", encoding="utf-8") as f:

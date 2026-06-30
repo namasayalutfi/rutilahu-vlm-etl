@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 @dataclass
 class SplitConfig:
-    input_path: Path = Path("metadata_sample/reconciled_sample_metadata_with_dtsen.json")
-    output_dir: Path = Path("metadata_sample/splits_house_type_aware")
+    input_path: Path = Path("output/mkn2_cleaned_metadata.json")
+    output_dir: Path = Path("splited_metadata")
     train_ratio: float = 0.8
     val_ratio: float = 0.1
     test_ratio: float = 0.1
@@ -427,7 +427,7 @@ class HouseTypeAwareHierarchicalStratifiedSplitter:
         train_path = out_dir / "train.json"
         val_path = out_dir / "val.json"
         test_path = out_dir / "test.json"
-        all_path = out_dir / "all_with_split.json"
+        all_path = out_dir / "all.json"
 
         self.save_json(split_buckets["train"], train_path)
         self.save_json(split_buckets["val"], val_path)

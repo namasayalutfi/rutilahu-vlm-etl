@@ -7,8 +7,8 @@ from typing import Dict, List, Any
 
 @dataclass
 class DTSENDummyConfig:
-    input_path: Path = Path("metadata/mkn2_metadata_final.json")
-    output_path: Path = Path("metadata/mkn2_final_metadata.json")
+    input_path: Path = Path("metadata/splited_metadata/all.json")
+    output_path: Path = Path("metadata/mkn2_metadata_production_ready.json")
     seed: int = 42
     same_probability: float = 0.7
 
@@ -24,7 +24,6 @@ class DTSENDummyGenerator:
             "Kayu/sirap",
             "Jerami/ijuk/daun-daunan/rumbia",
             "Lainnya",
-            "Tidak terdeteksi",
         ],
         "dinding": [
             "Tembok",
@@ -34,7 +33,6 @@ class DTSENDummyGenerator:
             "Batang kayu",
             "Bambu",
             "Lainnya",
-            "Tidak terdeteksi",
         ],
         "lantai": [
             "Marmer/granit",
@@ -46,7 +44,6 @@ class DTSENDummyGenerator:
             "Bambu",
             "Tanah",
             "Lainnya",
-            "Tidak terdeteksi",
         ],
     }
 
@@ -73,12 +70,9 @@ class DTSENDummyGenerator:
     def generate_dtsen_label(self, actual: str, component: str) -> str:
         candidates = self.LABELS[component]
 
-        if actual == "Tidak terdeteksi":
-            if self.rng.random() < self.config.same_probability:
-                return "Tidak terdeteksi"
-
-            other = [x for x in candidates if x != "Tidak terdeteksi"]
-            return self.rng.choice(other)
+        # actual bisa "Tidak terdeteksi", tapi dtsen tidak boleh punya label itu
+        if actual == "Tidak terdeteksi" or actual is None:
+            return self.rng.choice(candidates)
 
         if self.rng.random() < self.config.same_probability:
             return actual

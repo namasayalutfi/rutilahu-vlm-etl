@@ -15,8 +15,8 @@ from etl.download_images_and_metadata import DinsosHouseDownloadMetadataPipeline
 from etl.sample_metadata_from_multi import DinsosHouseMetadataSampler
 from etl.augment_sample_metadata_from_crawling import AugmentConfig, SampleMetadataAugmentor
 from etl.generate_labelstudio_metadata_input import LabelStudioConfig, LabelStudioMetadataGenerator
-from etl.reconcile_metadata import ReconcileConfig, LabelStudioMetadataReconciler
-from etl.generate_dtsen_status_dummy import DTSENDummyConfig, DTSENDummyGenerator
+from etl.reconcile_metadata_v2 import ReconcileConfig, LabelStudioMetadataReconciler
+from etl.generate_dtsen_status_dummy_v2 import DTSENDummyConfig, DTSENDummyGenerator
 from etl.split_metadata import (
     SplitConfig,
     HouseTypeAwareHierarchicalStratifiedSplitter,
@@ -40,8 +40,8 @@ class RutilahuETLPipeline:
 
         self.splitter = HouseTypeAwareHierarchicalStratifiedSplitter(
             SplitConfig(
-                input_path=Path("metadata_sample/reconciled_sample_metadata_with_dtsen.json"),
-                output_dir=Path("metadata_sample/splits_house_type_aware"),
+                input_path=Path("output/mkn2_cleaned_metadata.json"),
+                output_dir=Path("metadata/splited_metadata"),
                 train_ratio=0.8,
                 val_ratio=0.1,
                 test_ratio=0.1,
@@ -359,7 +359,7 @@ def main():
         did_run = True
 
     if args.merge_metadata:
-        pipeline.run_merge_metadata()
+        pipeline.run_merge_sample_metadata()
         did_run = True
     
     if args.split_labelstudio_input:

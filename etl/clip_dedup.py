@@ -6,14 +6,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
     CLEANED_METADATA,
+    DOWNLOAD_CHUNK_SIZE,
     DUPLICATE_REPORT,
     EMBEDDING_CACHE,
     OUTPUT_DIR,
     SIMILARITY_THRESHOLD,
 )
 from utils.dedup_engine import QdrantDedupEngine
-from utils.embedder import CLIPEmbedder
-from utils.image_loader import download_images_batch
+from utils.embedder import CLIPEmbedder, load_embedding_cache
+from utils.image_loader import download_images_streaming
 from utils.metadata_handler import (
     extract_image_records,
     load_metadata,
@@ -57,6 +58,13 @@ def parse_args():
         action="store_true",
         default=True,
         help="Hapus dan buat ulang Qdrant collection (default: True)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DOWNLOAD_CHUNK_SIZE,
+        help=f"Jumlah gambar per chunk untuk streaming download+encode "
+             f"(default: {DOWNLOAD_CHUNK_SIZE}). Turunkan jika RAM terbatas.",
     )
     return parser.parse_args()
 
@@ -142,26 +150,46 @@ def main():
     records  = extract_image_records(metadata)
     print(f"  → {len(metadata)} houses, {len(records)} image records")
 
-    # ── STEP 2: Download gambar ───────────────────────────────────────────────
-    image_dict = {}
+    # ── STEP 2 & 3: Streaming download + CLIP encoding ────────────────────────
+    # Kedua step ini digabung jadi satu loop: download 1 chunk kecil → encode
+    # chunk itu → flush ke cache di disk → buang dari RAM → lanjut chunk
+    # berikutnya. Ini mencegah RAM penuh saat dataset besar (20rb+ gambar).
+    print("\n[STEP 2+3] Streaming download + CLIP encoding...")
 
-    if not args.skip_download:
-        print("\n[STEP 2] Download gambar dari MinIO/HTTP...")
-        image_dict = download_images_batch(records)
-        print(f"  → {len(image_dict)} gambar berhasil didownload")
+    embedder = CLIPEmbedder()
+
+    if args.skip_download:
+        print("  → --skip-download aktif, langsung pakai embedding cache.")
+        embeddings = load_embedding_cache(EMBEDDING_CACHE)
     else:
-        print("\n[STEP 2] Skip download — akan pakai embedding cache jika tersedia.")
+        # RESUME LOGIC: skip image_id yang sudah ada di cache (misal dari
+        # run sebelumnya yang crash di tengah jalan), supaya tidak download
+        # ulang gambar yang sudah berhasil di-encode.
+        existing_cache = load_embedding_cache(EMBEDDING_CACHE)
+        records_to_process = [
+            r for r in records if r["image_id"] not in existing_cache
+        ]
+        skipped = len(records) - len(records_to_process)
+        if skipped > 0:
+            print(f"  → {skipped} gambar sudah ada di cache (dari run sebelumnya), "
+                  f"akan diskip. Sisa: {len(records_to_process)} gambar.")
 
-    # ── STEP 3: CLIP encoding ─────────────────────────────────────────────────
-    print("\n[STEP 3] CLIP encoding...")
-    embedder   = CLIPEmbedder()
-    embeddings = embedder.encode(
-        image_dict=image_dict,
-        cache_path=EMBEDDING_CACHE,
-    )
+        if records_to_process:
+            chunk_iterator = download_images_streaming(
+                records=records_to_process,
+                chunk_size=args.chunk_size,
+            )
+            embeddings = embedder.encode_streaming(
+                chunk_iterator=chunk_iterator,
+                cache_path=EMBEDDING_CACHE,
+                flush_every_chunk=True,  # crash-safe: simpan progress tiap chunk
+            )
+        else:
+            print("  → Semua gambar sudah ada di cache, tidak ada yang perlu didownload.")
+            embeddings = existing_cache
 
     if not embeddings:
-        print("[STEP 3] ERROR: Tidak ada embedding yang dihasilkan. Pipeline berhenti.")
+        print("[STEP 2+3] ERROR: Tidak ada embedding yang dihasilkan. Pipeline berhenti.")
         return
 
     print(f"  → {len(embeddings)} embedding siap")
